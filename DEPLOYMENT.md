@@ -44,7 +44,7 @@ Keep it in version control; porting is just `git clone`. **Never commit `.env`**
 
 ```bash
 cd agents
-LOCAL_API_KEY='<the key>' LOCAL_BASE_URL='https://<your-gateway-host>/api' bash setup.sh
+LOCAL_API_KEY='<the key>' LOCAL_BASE_URL='https://<your-gateway-host>' bash setup.sh
 ```
 
 `setup.sh` is path-independent and idempotent. It:
@@ -79,6 +79,32 @@ The routing/cost/fallback discipline must always be active. Ensure a `CLAUDE.md`
 Claude Code reads `CLAUDE.md` from the cwd and every parent up to `/`, so one file at the
 working root covers all subfolders (e.g. `/workspace/causal_discovery`). Use a path relative
 to that `CLAUDE.md` (`@agents/...` when it sits beside the `agents/` folder).
+
+### 2b. (Recommended) Register the routing-reminder hook
+
+The playbook loaded via `CLAUDE.md` is base context, but Claude can still drift and
+do delegable work itself. `hooks/route-reminder.py` is a `UserPromptSubmit` hook that
+inspects each prompt and, when it looks like final code / bulk fan-out / large-material
+reading, injects a short targeted reminder to run the ROUTING GATE and delegate to the
+right local model + tool. Trivial prompts get nothing.
+
+The script is in the repo (portable via git); the **registration is machine-local** —
+add it to your Claude Code `settings.json` (`~/.claude/settings.json`, or the running
+user's home) under `hooks`:
+
+```json
+"hooks": {
+  "UserPromptSubmit": [
+    { "hooks": [ { "type": "command",
+      "command": "<repo>/.venv/bin/python <repo>/hooks/route-reminder.py" } ] }
+  ]
+}
+```
+
+Use absolute paths (the `.venv/bin/python` created by `setup.sh` is guaranteed present).
+Takes effect in **new** Claude Code sessions. Test standalone:
+`echo '{"prompt":"напиши функцию"}' | <repo>/.venv/bin/python <repo>/hooks/route-reminder.py`
+should print a JSON `additionalContext`; a trivial prompt prints nothing.
 
 ### 3. Install Codex + apply the sandbox fix (for code tasks)
 
@@ -170,11 +196,11 @@ If Claude calls the tool, gets parallel results, and reports a shortlist — the
 - **`.env` is gitignored.** Re-create it per container via `setup.sh` (it copies `.env.example`).
 - **`server.py` auto-loads `.env`** from its own directory; exported env vars / `--env` still win.
 - **MCP is user scope**, so it works from any working directory in the container — not just `/workspace`.
-- **Endpoint is Open WebUI**, hence `/api` (not `/v1`) and explicit `*_PATH` vars. For a raw
-  OpenAI-compatible server set `LOCAL_BASE_URL=.../v1`, `LOCAL_MODELS_PATH=/models`,
-  `LOCAL_CHAT_COMPLETIONS_PATH=/chat/completions`.
-- **If a model (esp. DeepSeek-V4-Pro) is down**, that's expected — the playbook's §4 fallback
-  governs behavior. Not a deployment failure.
+- **Endpoint is a LiteLLM-style proxy**: `LOCAL_BASE_URL` is the bare host (no `/api`, no
+  `/v1`), with `LOCAL_MODELS_PATH=/models` and `LOCAL_CHAT_COMPLETIONS_PATH=/chat/completions`.
+  For a raw `/v1` server set `LOCAL_BASE_URL=.../v1` and keep the same `*_PATH` values.
+- **If a model (esp. the heavy code model, GLM-5.3) is down**, that's expected — the
+  playbook's §4 fallback governs behavior. Not a deployment failure.
 - **Codex write tasks failing with `bwrap: No permissions to create a new namespace`** = the
   sandbox gotcha in step 3c, not a broken install. Read-only Codex still works; apply 3c (or
   fix the container host-side) to enable write mode. Re-check after every codex plugin update.

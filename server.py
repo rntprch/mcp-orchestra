@@ -19,7 +19,10 @@ from mcp.server.fastmcp import FastMCP
 
 DEFAULT_BASE_URL = ""  # no baked-in default; the endpoint is private — set LOCAL_BASE_URL in .env
 DEFAULT_MAX_CONCURRENCY = 8
-DEFAULT_TIMEOUT_SECONDS = 120.0
+# Reasoning-heavy code generation runs for minutes, not seconds. The old 120s cut
+# the code model off mid-thought, which surfaced as "model unreachable" and tripped
+# the playbook's fallback discipline for what was really just an impatient client.
+DEFAULT_TIMEOUT_SECONDS = 1800.0
 DEFAULT_MODELS_PATH = "/models"
 DEFAULT_CHAT_COMPLETIONS_PATH = "/chat/completions"
 # Generous default budgets: local reasoning models (e.g. Qwen3.x) spend a large,
@@ -29,6 +32,57 @@ DEFAULT_MAX_TOKENS = 8192
 DEFAULT_COMPRESS_MAX_TOKENS = 4096
 MAX_ATTEMPTS = 3
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+# --- Reasoning -------------------------------------------------------------
+# What actually switches thinking differs per model family on this gateway
+# (measured 2026-09-08 against the live proxy):
+#   GLM-5.3 reads only chat_template_kwargs.reasoning_effort, with values
+#     low | high | max — anything else, "medium" included, behaves as "max";
+#     "low" is no thinking, "high" a one-line thought, "max" full thinking.
+#     The top-level reasoning_effort never reaches the template, and
+#     enable_thinking: false makes reasoning leak into content: never send it.
+#   Qwen3 on SGLang switches off only via chat_template_kwargs.enable_thinking:
+#     false; thinking: false does nothing. The top-level reasoning_effort is
+#     harmless but does not change depth.
+#   Every other model ignores these fields, and enable_thinking: false breaks
+#     the ollama coder model (garbage output starting with <|im_start|>):
+#     never send it to the default profile.
+# The level names come from SGLang itself, which rejects anything else with
+# "Input should be 'low', 'medium', 'high' or 'max'". "off" is ours.
+REASONING_LEVELS = ("off", "low", "medium", "high", "max")
+# Per-model defaults, applied when a caller passes no explicit level. This is what
+# makes the code route reason deeply without every call having to remember to ask.
+# GLM-5.3's default is "high" (one-line thought): "max" spends thousands of
+# reasoning tokens and minutes of latency for little gain on code tasks.
+MODEL_REASONING_DEFAULTS = {
+    "zai-org/GLM-5.3": "high",
+}
+# Levels a model must not run at; an explicit request for one is an error, not a
+# silent downgrade, so the caller learns to ask for "high".
+MODEL_REJECTED_LEVELS = {
+    "zai-org/GLM-5.3": ("max",),
+}
+# The field set each model actually responds to; see the measurements above.
+REASONING_PROFILES = {
+    "zai-org/GLM-5.3": "glm",
+    "Qwen/Qwen3.6-35B-A3B": "qwen3",
+    "Qwen/Qwen3.5-397B-A17B-FP8": "qwen3",
+}
+DEFAULT_REASONING_PROFILE = "default"
+# GLM's template understands low | high | max, but "max" is deliberately never sent
+# (see MODEL_REJECTED_LEVELS); the mapping still covers it as a safety net.
+GLM_TEMPLATE_EFFORT = {"off": "low", "low": "low", "medium": "high", "high": "high", "max": "high"}
+# Which fields to actually send. "effort+thinking" is the full set for this gateway;
+# the narrower values exist as an escape hatch if a future endpoint rejects one.
+DEFAULT_REASONING_FIELDS = "effort+thinking"
+REASONING_FIELD_MODES = ("effort+thinking", "thinking", "off")
+# Reasoning is billed inside completion_tokens, so the visible answer and the chain
+# of thought share one budget. 8192 truncates real code tasks; the code model's
+# context is far larger than 32k, so 32k is comfortable.
+DEFAULT_REASONING_MAX_TOKENS = 32768
+# Status codes that mean "the endpoint disliked the request body" — the trigger for
+# one retry with the reasoning fields stripped.
+REASONING_REJECT_STATUSES = {400, 422}
 
 
 logger = logging.getLogger("local_llm_mcp")
@@ -78,6 +132,10 @@ class ConfigError(RuntimeError):
 class LocalAPIError(RuntimeError):
     """Actionable error from the local model endpoint."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 @dataclass(frozen=True)
 class Config:
@@ -87,6 +145,7 @@ class Config:
     timeout_seconds: float
     models_path: str
     chat_completions_path: str
+    reasoning_fields: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -110,6 +169,12 @@ class Config:
             os.environ.get("LOCAL_TIMEOUT_SECONDS"),
             DEFAULT_TIMEOUT_SECONDS,
         )
+        reasoning_fields = parse_choice(
+            "LOCAL_REASONING_FIELDS",
+            os.environ.get("LOCAL_REASONING_FIELDS"),
+            DEFAULT_REASONING_FIELDS,
+            REASONING_FIELD_MODES,
+        )
 
         return cls(
             base_url=base_url,
@@ -118,6 +183,7 @@ class Config:
             timeout_seconds=timeout_seconds,
             models_path=models_path,
             chat_completions_path=chat_completions_path,
+            reasoning_fields=reasoning_fields,
         )
 
 
@@ -127,6 +193,24 @@ class ChatCompletion:
     latency_ms: int
     usage: dict[str, Any] | None
     finish_reason: str | None = None
+    reasoning: str = "off"
+    # Length only, never the chain of thought itself: reading it would burn exactly
+    # the orchestrator budget this whole server exists to protect.
+    reasoning_chars: int = 0
+    # True when the endpoint refused the reasoning fields and we retried without them.
+    reasoning_downgraded: bool = False
+    # True when the model put its answer in reasoning_content and left content empty.
+    content_from_reasoning: bool = False
+    max_tokens: int = DEFAULT_MAX_TOKENS
+
+
+def parse_choice(name: str, raw: str | None, default: str, allowed: tuple[str, ...]) -> str:
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        raise ConfigError(f"{name} must be one of {', '.join(allowed)}; got {raw!r}.")
+    return value
 
 
 def parse_positive_int(name: str, raw: str | None, default: int) -> int:
@@ -192,10 +276,149 @@ def normalize_content(content: Any) -> str:
 
 
 def usage_token_count(usage: dict[str, Any] | None, key: str) -> int | None:
+    """Read a token counter out of a usage block, top level first.
+
+    The proxy reports reasoning tokens at
+    usage["completion_tokens_details"]["reasoning_tokens"] rather than at the top
+    level of usage, so the nested details dict is the fallback.
+
+    Args:
+        usage: The usage object from a completion response, or None.
+        key: The counter name to read, e.g. "reasoning_tokens".
+
+    Returns:
+        The int found at usage[key] or at
+        usage["completion_tokens_details"][key], or None when usage is not a
+        dict or neither lookup yields an int.
+    """
     if not isinstance(usage, dict):
         return None
     value = usage.get(key)
-    return value if isinstance(value, int) else None
+    if isinstance(value, int):
+        return value
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict):
+        nested = details.get(key)
+        if isinstance(nested, int):
+            return nested
+    return None
+
+
+def resolve_reasoning(model: str, requested: str) -> str:
+    """Pick the reasoning level for a call: explicit request beats the per-model default.
+
+    An empty string means "caller did not say", which is what lets the code route get
+    deep reasoning without every call site remembering to ask for it.
+
+    Args:
+        model: Model identifier whose per-model default and rejected levels apply.
+        requested: Explicitly requested reasoning level; empty (or None) when the
+            caller did not say.
+
+    Returns:
+        The resolved reasoning level: the validated explicit request, or the
+        model's default ("off" for models without one).
+
+    Raises:
+        ValueError: If `requested` is not a known level, or is a per-model
+            rejected level for this model.
+    """
+    level = (requested or "").strip().lower()
+    if not level:
+        return MODEL_REASONING_DEFAULTS.get(model, "off")
+    if level not in REASONING_LEVELS:
+        raise ValueError(
+            f"Unknown reasoning level {requested!r}. Valid levels: {', '.join(REASONING_LEVELS)}."
+        )
+    if level in MODEL_REJECTED_LEVELS.get(model, ()):
+        raise ValueError(
+            f"Reasoning level {level!r} is not allowed for model {model!r}; use \"high\" instead."
+        )
+    return level
+
+
+def reasoning_profile(model: str) -> str:
+    """Return the reasoning profile that applies to a model.
+
+    The profile names the field set that actually switches thinking for that
+    model on this gateway; see the measurement notes above the constants.
+
+    Args:
+        model: The model id from the request.
+
+    Returns:
+        The profile name from REASONING_PROFILES, or
+        DEFAULT_REASONING_PROFILE for models without a measured field set.
+    """
+    return REASONING_PROFILES.get(model, DEFAULT_REASONING_PROFILE)
+
+
+def reasoning_report(completion: ChatCompletion) -> dict[str, Any]:
+    """Reasoning provenance for a tool result: what depth ran, and whether it held.
+
+    The two flags are omitted when false so a normal result stays uncluttered — they
+    only appear when something worth knowing happened.
+    """
+    report: dict[str, Any] = {
+        "reasoning": completion.reasoning,
+        "reasoning_chars": completion.reasoning_chars,
+    }
+    if completion.reasoning_downgraded:
+        report["reasoning_downgraded"] = True
+    if completion.content_from_reasoning:
+        report["content_from_reasoning"] = True
+    return report
+
+
+def reasoning_payload_fields(level: str, mode: str, profile: str) -> dict[str, Any]:
+    """Build the request fields that switch thinking on for a model.
+
+    The field that actually flips the switch differs per model family on this
+    gateway, so the profile selects the field set and the level fills in the
+    values.
+
+    Args:
+        level: Requested reasoning level; one of REASONING_LEVELS.
+        mode: One of REASONING_FIELD_MODES. "off" returns no fields for any
+            profile; "effort+thinking" also sends the top-level
+            reasoning_effort; "thinking" sends template kwargs only.
+        profile: A profile name from REASONING_PROFILES, or
+            DEFAULT_REASONING_PROFILE; unknown names behave as "default".
+
+    Returns:
+        The request fields to merge into the completion payload. Empty when
+        the mode is "off", or when reasoning is off and the profile sends
+        nothing for that.
+
+    Never send enable_thinking to GLM: the proxy stops separating reasoning
+    and it leaks into content. Never send enable_thinking to the default
+    profile: it breaks the ollama coder model with garbage output.
+    """
+    if level not in REASONING_LEVELS:
+        raise ValueError(
+            f"Unknown reasoning level {level!r}. Valid levels: {', '.join(REASONING_LEVELS)}."
+        )
+    if mode == "off":
+        # Escape hatch: no reasoning fields at all, whatever the profile.
+        return {}
+    if profile == "glm":
+        # GLM's template reads only reasoning_effort; "low" is its no-thinking value.
+        fields: dict[str, Any] = {
+            "chat_template_kwargs": {"reasoning_effort": GLM_TEMPLATE_EFFORT[level]}
+        }
+        if mode == "effort+thinking" and level != "off":
+            # Inert on GLM, kept so the mode means the same thing across profiles.
+            fields["reasoning_effort"] = level
+        return fields
+    if level == "off":
+        if profile == "qwen3":
+            # The only switch that actually stops Qwen3's thinking.
+            return {"chat_template_kwargs": {"enable_thinking": False}}
+        return {}
+    fields = {"chat_template_kwargs": {"thinking": True}}
+    if mode == "effort+thinking":
+        fields["reasoning_effort"] = level
+    return fields
 
 
 def empty_content_diagnostic(
@@ -204,6 +427,7 @@ def empty_content_diagnostic(
     finish_reason: str | None,
     usage: dict[str, Any] | None,
     max_tokens: int,
+    reasoning: str = "off",
 ) -> dict[str, Any]:
     """Build an actionable error for a completion that returned empty content.
 
@@ -216,11 +440,14 @@ def empty_content_diagnostic(
         completion_tokens is not None and completion_tokens >= max_tokens
     )
     if budget_exhausted:
+        remedy = "Raise max_tokens (e.g. >=4000)"
+        if reasoning != "off":
+            remedy += f', or lower the reasoning level (currently {reasoning!r}; "off" disables it)'
         error = (
             f"Model {model!r} returned empty content because the max_tokens budget "
             f"({max_tokens}) was consumed by hidden reasoning "
             f"(reasoning_tokens={reasoning_tokens}, completion_tokens={completion_tokens}, "
-            f"finish_reason={finish_reason!r}). Raise max_tokens (e.g. >=4000) and retry."
+            f"finish_reason={finish_reason!r}). {remedy} and retry."
         )
     else:
         error = (
@@ -233,6 +460,7 @@ def empty_content_diagnostic(
         "completion_tokens": completion_tokens,
         "reasoning_tokens": reasoning_tokens,
         "max_tokens": max_tokens,
+        "reasoning": reasoning,
     }
 
 
@@ -432,28 +660,63 @@ class LocalLLMService:
         prompt: str,
         system: str = "",
         temperature: float = 0.7,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_tokens: int | None = None,
+        reasoning: str = "",
     ) -> ChatCompletion:
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        level = resolve_reasoning(model, reasoning)
+        profile = reasoning_profile(model)
+        reasoning_fields = reasoning_payload_fields(level, self.config.reasoning_fields, profile)
+        if max_tokens is None:
+            # Reasoning shares the completion budget with the visible answer, so the
+            # normal default would spend itself on thinking and truncate the result.
+            # Budget by the level, not by whether fields were built: "off" still
+            # sends fields for some profiles.
+            max_tokens = DEFAULT_REASONING_MAX_TOKENS if level != "off" else DEFAULT_MAX_TOKENS
+
         payload = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            **reasoning_fields,
         }
 
         start = time.perf_counter()
+        downgraded = False
         async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
-            response_payload = await self._request_json_with_retries(
-                client,
-                "POST",
-                self.config.chat_completions_path,
-                json_payload=payload,
-            )
+            try:
+                response_payload = await self._request_json_with_retries(
+                    client,
+                    "POST",
+                    self.config.chat_completions_path,
+                    json_payload=payload,
+                )
+            except LocalAPIError as exc:
+                # The endpoint rejected the body. If we were the ones adding non-standard
+                # reasoning fields, retry once without them rather than failing the whole
+                # call — a code route must not go down over one unsupported parameter.
+                if not reasoning_fields or exc.status_code not in REASONING_REJECT_STATUSES:
+                    raise
+                logger.warning(
+                    "reasoning fields rejected by endpoint for model %r (HTTP %s); retrying without them",
+                    model,
+                    exc.status_code,
+                )
+                downgraded = True
+                level = "off"
+                for key in reasoning_fields:
+                    payload.pop(key, None)
+                response_payload = await self._request_json_with_retries(
+                    client,
+                    "POST",
+                    self.config.chat_completions_path,
+                    json_payload=payload,
+                )
 
         choices = response_payload.get("choices") if isinstance(response_payload, dict) else None
         if not isinstance(choices, list) or not choices:
@@ -467,8 +730,13 @@ class LocalLLMService:
             raise LocalAPIError(f"Chat completion for model {model!r} returned an invalid choice.")
 
         message = first_choice.get("message")
+        reasoning_text = ""
         if isinstance(message, dict):
             content = normalize_content(message.get("content"))
+            # SGLang returns the chain of thought beside the answer, not inside it.
+            reasoning_text = normalize_content(
+                message.get("reasoning_content") or message.get("reasoning")
+            )
         else:
             content = normalize_content(first_choice.get("text"))
 
@@ -476,12 +744,26 @@ class LocalLLMService:
         if not isinstance(finish_reason, str):
             finish_reason = None
 
+        # Some builds put the whole answer in the reasoning field and leave content
+        # empty. That is a usable answer, not the empty-response failure it looks like.
+        # Not when the budget ran out mid-thought, though: then the reasoning is a
+        # truncated chain of thought, not an answer, and the diagnostic must fire.
+        content_from_reasoning = False
+        if not content.strip() and reasoning_text.strip() and finish_reason != "length":
+            content = reasoning_text
+            content_from_reasoning = True
+
         usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
         return ChatCompletion(
             content=content,
             latency_ms=elapsed_ms(start),
             usage=usage,
             finish_reason=finish_reason,
+            reasoning=level,
+            reasoning_chars=len(reasoning_text),
+            reasoning_downgraded=downgraded,
+            content_from_reasoning=content_from_reasoning,
+            max_tokens=max_tokens,
         )
 
     async def _request_json_with_retries(
@@ -518,7 +800,8 @@ class LocalLLMService:
             if response.status_code < 200 or response.status_code >= 300:
                 raise LocalAPIError(
                     f"{method} {url} failed with HTTP {response.status_code}. "
-                    f"Response body: {preview_body(response.text)}"
+                    f"Response body: {preview_body(response.text)}",
+                    status_code=response.status_code,
                 )
 
             try:
@@ -592,9 +875,19 @@ async def local_generate(
     prompt: str,
     system: str = "",
     temperature: float = 0.7,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
+    max_tokens: int | None = None,
+    reasoning: str = "",
 ) -> dict[str, Any]:
-    """Generate one chat completion using a discovered local model."""
+    """Generate one chat completion using a discovered local model.
+
+    reasoning: "off", "low", "medium", "high" or "max". Leave empty to use the
+    model's default depth — GLM-5.3 reasons at "high" unless told otherwise, and
+    rejects "max" (ok:false; ask for "high"). "off" really stops the thinking on
+    GLM-5.3 and the Qwen3 models; other models ignore the parameter. Deep reasoning
+    costs latency and completion tokens, so pass "off" for cheap work.
+    max_tokens: leave unset to get a budget that fits the chosen reasoning depth.
+    The chain of thought is not returned; reasoning_chars reports its size.
+    """
     start = time.perf_counter()
     usage: dict[str, Any] | None = None
     error: str | None = None
@@ -611,6 +904,7 @@ async def local_generate(
             system=system,
             temperature=temperature,
             max_tokens=max_tokens,
+            reasoning=reasoning,
         )
         usage = completion.usage
         if not completion.content.strip():
@@ -618,7 +912,8 @@ async def local_generate(
                 model,
                 finish_reason=completion.finish_reason,
                 usage=completion.usage,
-                max_tokens=max_tokens,
+                max_tokens=completion.max_tokens,
+                reasoning=completion.reasoning,
             )
             error = diagnostic["error"]
             return {"ok": False, "model": model, "latency_ms": completion.latency_ms, **diagnostic}
@@ -629,6 +924,7 @@ async def local_generate(
             "latency_ms": completion.latency_ms,
             "usage": completion.usage,
             "finish_reason": completion.finish_reason,
+            **reasoning_report(completion),
         }
     except Exception as exc:
         error = str(exc)
@@ -647,7 +943,13 @@ async def local_generate(
 
 @mcp.tool()
 async def local_batch(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Run many local chat completions concurrently and return results in input order."""
+    """Run many local chat completions concurrently and return results in input order.
+
+    Each job: {model, prompt, system?, temperature?, max_tokens?, reasoning?}.
+    reasoning accepts "off"/"low"/"medium"/"high"/"max"; omit it to take the model's
+    default depth. Fan-out work on the bulk model wants "off" — deep reasoning across
+    many jobs multiplies latency for little gain.
+    """
     start = time.perf_counter()
     service = get_service()
     await service.ensure_discovered()
@@ -682,13 +984,17 @@ async def run_batch_job(index: int, job: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if not isinstance(job, dict):
-            raise ValueError("Each job must be an object with model, prompt, system?, temperature?, max_tokens?.")
+            raise ValueError(
+                "Each job must be an object with model, prompt, system?, temperature?, "
+                "max_tokens?, reasoning?."
+            )
 
         model = require_string(job, "model")
         prompt = require_string(job, "prompt")
         system = optional_string(job, "system", "")
         temperature = optional_float(job, "temperature", 0.7)
-        max_tokens = optional_positive_int(job, "max_tokens", DEFAULT_MAX_TOKENS)
+        max_tokens = optional_positive_int_or_none(job, "max_tokens")
+        reasoning = optional_string(job, "reasoning", "")
 
         service = get_service()
         validation_error = await service.validate_model(model)
@@ -701,6 +1007,7 @@ async def run_batch_job(index: int, job: dict[str, Any]) -> dict[str, Any]:
             system=system,
             temperature=temperature,
             max_tokens=max_tokens,
+            reasoning=reasoning,
         )
         usage = completion.usage
         if not completion.content.strip():
@@ -708,7 +1015,8 @@ async def run_batch_job(index: int, job: dict[str, Any]) -> dict[str, Any]:
                 model,
                 finish_reason=completion.finish_reason,
                 usage=completion.usage,
-                max_tokens=max_tokens,
+                max_tokens=completion.max_tokens,
+                reasoning=completion.reasoning,
             )
             error = diagnostic["error"]
             return {
@@ -726,6 +1034,7 @@ async def run_batch_job(index: int, job: dict[str, Any]) -> dict[str, Any]:
             "latency_ms": completion.latency_ms,
             "usage": completion.usage,
             "finish_reason": completion.finish_reason,
+            **reasoning_report(completion),
         }
     except Exception as exc:
         error = str(exc)
@@ -772,6 +1081,10 @@ async def local_compress(
             system=instruction,
             temperature=0.2,
             max_tokens=max_tokens,
+            # Compression is mechanical: a chain of thought would eat the budget meant
+            # for the concentrate. Explicit "off" so a reasoning-default model can't
+            # silently spend this call on thinking.
+            reasoning="off",
         )
         usage = completion.usage
         if not completion.content.strip():
@@ -834,6 +1147,17 @@ def optional_positive_int(job: dict[str, Any], key: str, default: int) -> int:
     if number < 1:
         raise ValueError(f"Job field {key!r} must be a positive integer.")
     return number
+
+
+def optional_positive_int_or_none(job: dict[str, Any], key: str) -> int | None:
+    """Like optional_positive_int, but absence means "let the server choose".
+
+    Needed because the max_tokens default now depends on the reasoning depth, which
+    is resolved further down; a sentinel default here would hide that decision.
+    """
+    if key not in job or job[key] is None:
+        return None
+    return optional_positive_int(job, key, DEFAULT_MAX_TOKENS)
 
 
 def parse_args() -> argparse.Namespace:
